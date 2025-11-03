@@ -2,11 +2,14 @@ import os
 import tempfile
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 from contextlib import asynccontextmanager
+import uuid
+from datetime import datetime
+from enum import Enum
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 import torch
 import numpy as np
 from PIL import Image
@@ -33,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 S3_BUCKET = os.getenv("S3_BUCKET", "echomimic-video-gen-models")  # Get from env or use default
+S3_OUTPUT_BUCKET = "demo-goml"  # Output bucket for generated videos
 PRETRAINED_WEIGHTS_DIR = Path("./pretrained_weights")
 CONFIG_PATH = "./configs/prompts/infer_acc.yaml"
 
@@ -46,6 +50,17 @@ REQUIRED_MODEL_FILES = {
     "motion_module_acc.pth": "file",
     "audio_processor/tiny.pt": "file"
 }
+
+# Job status tracking
+class JobStatus(str, Enum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    UPLOADING = "uploading"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+# In-memory job storage (use Redis/database for production)
+jobs: Dict[str, Dict] = {}
 
 
 def download_from_s3_if_needed():
@@ -149,6 +164,305 @@ def check_models_available() -> dict:
             status[model_name] = model_path.exists() and model_path.is_file()
     
     return status
+
+
+def upload_to_s3(file_path: Path, s3_key: str) -> str:
+    """
+    Upload file to S3 and return public URL
+    
+    Args:
+        file_path: Local file path to upload
+        s3_key: S3 key (filename in bucket)
+    
+    Returns:
+        S3 URL of uploaded file
+    """
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+        
+        s3_client = boto3.client('s3')
+        
+        # Upload file
+        logger.info(f"Uploading {file_path.name} to s3://{S3_OUTPUT_BUCKET}/{s3_key}")
+        s3_client.upload_file(
+            str(file_path),
+            S3_OUTPUT_BUCKET,
+            s3_key,
+            ExtraArgs={'ContentType': 'video/mp4'}
+        )
+        
+        # Generate public URL (or presigned URL for private buckets)
+        s3_url = f"https://{S3_OUTPUT_BUCKET}.s3.amazonaws.com/{s3_key}"
+        
+        # Alternative: Generate presigned URL (expires after 7 days)
+        # s3_url = s3_client.generate_presigned_url(
+        #     'get_object',
+        #     Params={'Bucket': S3_OUTPUT_BUCKET, 'Key': s3_key},
+        #     ExpiresIn=604800  # 7 days
+        # )
+        
+        logger.info(f"Upload successful: {s3_url}")
+        return s3_url
+        
+    except ImportError:
+        logger.error("boto3 not installed. Cannot upload to S3.")
+        raise Exception("boto3 not available for S3 upload")
+    except ClientError as e:
+        logger.error(f"S3 upload failed: {e}")
+        raise Exception(f"Failed to upload to S3: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during S3 upload: {e}")
+        raise
+
+
+def process_video_task(
+    job_id: str,
+    image_path: Path,
+    audio_path: Path,
+    pose_dir_name: str,
+    width: int,
+    height: int,
+    length: Optional[int],
+    steps: int,
+    cfg: float,
+    fps: int,
+    seed: int,
+    image_filename: str,
+    audio_filename: str
+):
+    """
+    Background task to process video generation and upload to S3
+    """
+    temp_dir = image_path.parent
+    
+    try:
+        # Update job status
+        jobs[job_id]["status"] = JobStatus.PROCESSING
+        jobs[job_id]["progress"] = "Loading resources..."
+        
+        logger.info(f"[Job {job_id}] Starting video generation")
+        
+        # Setup paths
+        pose_dir = Path(f"./assets/halfbody_demo/pose/{pose_dir_name}")
+        if not pose_dir.exists():
+            raise Exception(f"Pose directory '{pose_dir_name}' not found")
+        
+        # Load audio and calculate length
+        jobs[job_id]["progress"] = "Processing audio..."
+        audio_clip = AudioFileClip(str(audio_path))
+        audio_duration = audio_clip.duration
+        
+        # Get pose count
+        pose_count = len([f for f in os.listdir(pose_dir) if f.endswith('.npy')])
+        
+        # Calculate video length
+        max_audio_frames = int(audio_duration * fps)
+        if length is None:
+            video_length = max_audio_frames
+        else:
+            video_length = min(length, max_audio_frames)
+        
+        logger.info(f"[Job {job_id}] Audio: {audio_duration:.2f}s ({max_audio_frames} frames)")
+        logger.info(f"[Job {job_id}] Generating: {video_length} frames ({video_length/fps:.2f}s)")
+        
+        jobs[job_id]["video_duration"] = f"{video_length/fps:.2f}s"
+        jobs[job_id]["total_frames"] = video_length
+        
+        # Load reference image
+        jobs[job_id]["progress"] = "Loading reference image..."
+        ref_img_pil = Image.open(image_path).convert("RGB")
+        ref_img_pil = ref_img_pil.resize((width, height))
+        
+        # Validate reference image
+        ref_array = np.array(ref_img_pil)
+        if ref_array.size == 0:
+            raise Exception("Invalid reference image: empty array")
+        
+        if np.isnan(ref_array).any() or np.isinf(ref_array).any():
+            logger.warning(f"[Job {job_id}] Reference image contains invalid values, cleaning")
+            ref_array = np.nan_to_num(ref_array, nan=0.0, posinf=255.0, neginf=0.0)
+            ref_img_pil = Image.fromarray(ref_array.astype(np.uint8))
+        
+        # Generate seed
+        if seed is not None and seed > -1:
+            generator = torch.manual_seed(seed)
+        else:
+            generator = torch.manual_seed(42)
+        
+        # Load poses with looping
+        jobs[job_id]["progress"] = f"Loading {video_length} pose frames..."
+        logger.info(f"[Job {job_id}] Loading poses...")
+        pose_list = []
+        
+        for index in range(video_length):
+            pose_index = index % pose_count
+            
+            tgt_musk = np.zeros((height, width, 3)).astype('uint8')
+            tgt_musk_path = os.path.join(pose_dir, f"{pose_index}.npy")
+            
+            if not os.path.exists(tgt_musk_path):
+                logger.warning(f"[Job {job_id}] Pose file {pose_index}.npy not found, skipping")
+                continue
+            
+            detected_pose = np.load(tgt_musk_path, allow_pickle=True).tolist()
+            imh_new, imw_new, rb, re, cb, ce = detected_pose['draw_pose_params']
+            
+            # Validate pose parameters
+            if rb < 0 or cb < 0 or re > height or ce > width or rb >= re or cb >= ce:
+                rb = max(0, min(rb, height))
+                re = max(rb + 1, min(re, height))
+                cb = max(0, min(cb, width))
+                ce = max(cb + 1, min(ce, width))
+            
+            im = draw_pose_select_v2(detected_pose, imh_new, imw_new, ref_w=min(width, height))
+            im = np.transpose(np.array(im), (1, 2, 0))
+            
+            if im.size == 0:
+                tgt_musk_pil = Image.fromarray(tgt_musk).convert('RGB')
+                pose_list.append(
+                    torch.Tensor(np.array(tgt_musk_pil)).to(dtype=weight_dtype, device=device).permute(2, 0, 1) / 255.0
+                )
+                continue
+            
+            if np.isnan(im).any() or np.isinf(im).any():
+                im = np.nan_to_num(im, nan=0.0, posinf=255.0, neginf=0.0)
+            
+            target_h = re - rb
+            target_w = ce - cb
+            
+            if im.shape[0] != target_h or im.shape[1] != target_w:
+                if target_h > 0 and target_w > 0:
+                    im = cv2.resize(im, (target_w, target_h))
+                else:
+                    continue
+            
+            if rb >= 0 and cb >= 0 and re <= height and ce <= width and rb < re and cb < ce:
+                tgt_musk[rb:re, cb:ce, :] = im
+            else:
+                continue
+            
+            tgt_musk_pil = Image.fromarray(np.array(tgt_musk)).convert('RGB')
+            pose_tensor = torch.Tensor(np.array(tgt_musk_pil)).to(dtype=weight_dtype, device=device).permute(2, 0, 1) / 255.0
+            
+            if torch.isnan(pose_tensor).any() or torch.isinf(pose_tensor).any():
+                pose_tensor = torch.nan_to_num(pose_tensor, nan=0.0, posinf=1.0, neginf=0.0)
+                pose_tensor = torch.clamp(pose_tensor, 0.0, 1.0)
+            
+            pose_list.append(pose_tensor)
+        
+        poses_tensor = torch.stack(pose_list, dim=1).unsqueeze(0)
+        audio_clip_trimmed = audio_clip.set_duration(video_length / fps)
+        
+        # Generate video
+        jobs[job_id]["progress"] = f"Generating video ({video_length} frames)... This may take several minutes."
+        logger.info(f"[Job {job_id}] Generating video frames...")
+        
+        with torch.no_grad():
+            video = pipeline(
+                ref_img_pil,
+                str(audio_path),
+                poses_tensor[:, :, :video_length, ...],
+                width,
+                height,
+                video_length,
+                steps,
+                cfg,
+                generator=generator,
+                audio_sample_rate=16000,
+                context_frames=12,
+                fps=fps,
+                context_overlap=3,
+                start_idx=0
+            ).videos
+        
+        # Clean invalid values
+        if torch.isnan(video).any() or torch.isinf(video).any():
+            logger.warning(f"[Job {job_id}] Video tensor contains invalid values! Cleaning...")
+            video = torch.nan_to_num(video, nan=0.0, posinf=1.0, neginf=0.0)
+            video = torch.clamp(video, 0.0, 1.0)
+        
+        final_length = min(video.shape[2], poses_tensor.shape[2], video_length)
+        video_sig = video[:, :, :final_length, :, :]
+        
+        # Save video without audio
+        jobs[job_id]["progress"] = "Encoding video..."
+        logger.info(f"[Job {job_id}] Saving video frames...")
+        
+        output_path_no_audio = temp_dir / "output_no_audio.mp4"
+        save_videos_grid(
+            video_sig,
+            str(output_path_no_audio),
+            n_rows=1,
+            fps=fps,
+        )
+        
+        if not output_path_no_audio.exists():
+            raise Exception("Failed to create video file")
+        
+        video_size = output_path_no_audio.stat().st_size
+        if video_size < 1000:
+            raise Exception("Generated video is corrupted")
+        
+        # Add audio
+        jobs[job_id]["progress"] = "Adding audio..."
+        logger.info(f"[Job {job_id}] Adding audio to video...")
+        
+        output_path = temp_dir / f"{job_id}.mp4"
+        
+        try:
+            video_clip = VideoFileClip(str(output_path_no_audio))
+            video_clip = video_clip.set_audio(audio_clip_trimmed)
+            video_clip.write_videofile(
+                str(output_path),
+                codec="libx264",
+                audio_codec="aac",
+                threads=2,
+                logger=None,
+                preset='medium',
+                bitrate='5000k'
+            )
+            video_clip.close()
+        except Exception as e:
+            logger.error(f"[Job {job_id}] Error adding audio: {e}")
+            output_path = output_path_no_audio
+        
+        audio_clip.close()
+        audio_clip_trimmed.close()
+        
+        logger.info(f"[Job {job_id}] Video generated successfully: {output_path}")
+        
+        # Upload to S3
+        jobs[job_id]["status"] = JobStatus.UPLOADING
+        jobs[job_id]["progress"] = "Uploading to S3..."
+        
+        s3_key = f"generated/{job_id}.mp4"
+        s3_url = upload_to_s3(output_path, s3_key)
+        
+        # Update job as completed
+        jobs[job_id]["status"] = JobStatus.COMPLETED
+        jobs[job_id]["progress"] = "Completed"
+        jobs[job_id]["video_url"] = s3_url
+        jobs[job_id]["s3_key"] = s3_key
+        jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+        jobs[job_id]["file_size_bytes"] = output_path.stat().st_size
+        
+        logger.info(f"[Job {job_id}] ✓ Completed! Video available at: {s3_url}")
+        
+    except Exception as e:
+        logger.error(f"[Job {job_id}] Error: {e}")
+        jobs[job_id]["status"] = JobStatus.FAILED
+        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["failed_at"] = datetime.utcnow().isoformat()
+    
+    finally:
+        # Cleanup temp files
+        try:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.info(f"[Job {job_id}] Cleaned up temp directory")
+        except:
+            pass
 
 
 def load_models():
@@ -317,6 +631,7 @@ app = FastAPI(
 
 @app.post("/generate-video")
 async def generate_video(
+    background_tasks: BackgroundTasks,
     image: UploadFile = File(..., description="Reference image (PNG/JPG)"),
     audio: UploadFile = File(..., description="Audio file (WAV/MP3)"),
     pose_dir_name: Optional[str] = "01",
@@ -329,18 +644,25 @@ async def generate_video(
     seed: Optional[int] = 420,
 ):
     """
-    Generate video from image and audio
+    Generate video from image and audio (async background processing)
+    
+    Returns job ID immediately. Video is processed in background and uploaded to S3.
+    Use /job-status/{job_id} to check progress.
     
     Args:
         image: Reference image file
         audio: Audio file
-        length: Video length in frames (default: 240 = 10 seconds at 24fps)
-        steps: Denoising steps (default: 4)
-        cfg: Classifier-free guidance scale (default: 2.5)
+        pose_dir_name: Pose directory name (default: "01")
+        width: Video width (default: 768)
+        height: Video height (default: 768)
+        length: Video length in frames (default: auto from audio)
+        steps: Denoising steps (default: 6)
+        cfg: Classifier-free guidance scale (default: 1.0)
         fps: Frames per second (default: 24)
+        seed: Random seed (default: 420)
     
     Returns:
-        Video file with synchronized audio
+        JSON with job_id and status_url
     """
     if pipeline is None:
         models_status = check_models_available()
@@ -357,8 +679,11 @@ async def generate_video(
         }
         raise HTTPException(status_code=503, detail=error_detail)
     
-    # Create temp directory for processing
-    temp_dir = Path(tempfile.mkdtemp())
+    # Generate unique job ID
+    job_id = str(uuid.uuid4())
+    
+    # Create temp directory for this job
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"job_{job_id}_"))
     
     try:
         # Save uploaded files
@@ -371,231 +696,115 @@ async def generate_video(
         with open(audio_path, "wb") as f:
             f.write(await audio.read())
         
-        logger.info(f"Processing - Image: {image.filename}, Audio: {audio.filename}")
+        # Initialize job tracking
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": JobStatus.QUEUED,
+            "progress": "Queued for processing",
+            "created_at": datetime.utcnow().isoformat(),
+            "params": {
+                "image_filename": image.filename,
+                "audio_filename": audio.filename,
+                "pose_dir_name": pose_dir_name,
+                "width": width,
+                "height": height,
+                "length": length,
+                "steps": steps,
+                "cfg": cfg,
+                "fps": fps,
+                "seed": seed
+            }
+        }
         
-        # Setup paths
-        pose_dir = Path(f"./assets/halfbody_demo/pose/{pose_dir_name}")
-        if not pose_dir.exists():
-            raise HTTPException(status_code=400, detail=f"Pose directory '{pose_dir_name}' not found")
-        
-        # Load audio and calculate length
-        audio_clip = AudioFileClip(str(audio_path))
-        audio_duration = audio_clip.duration
-        
-        # Get pose count
-        pose_count = len([f for f in os.listdir(pose_dir) if f.endswith('.npy')])
-        
-        # Calculate video length
-        max_audio_frames = int(audio_duration * fps)
-        if length is None:
-            video_length = max_audio_frames
-        else:
-            video_length = min(length, max_audio_frames)
-        
-        logger.info(f"Audio: {audio_duration:.2f}s ({max_audio_frames} frames)")
-        logger.info(f"Pose files: {pose_count}")
-        logger.info(f"Generating: {video_length} frames ({video_length/fps:.2f}s)")
-        logger.info(f"Pose loops: {video_length / pose_count:.2f}x")
-        
-        # Load reference image
-        ref_img_pil = Image.open(image_path).convert("RGB")
-        
-        # Resize to target dimensions
-        ref_img_pil = ref_img_pil.resize((width, height))
-        
-        # Validate reference image
-        ref_array = np.array(ref_img_pil)
-        if ref_array.size == 0:
-            raise HTTPException(status_code=400, detail="Invalid reference image: empty array")
-        
-        if np.isnan(ref_array).any() or np.isinf(ref_array).any():
-            logger.warning("Reference image contains invalid values, cleaning")
-            ref_array = np.nan_to_num(ref_array, nan=0.0, posinf=255.0, neginf=0.0)
-            ref_img_pil = Image.fromarray(ref_array.astype(np.uint8))
-        
-        logger.info(f"Reference image loaded: {ref_array.shape}, range: [{ref_array.min()}, {ref_array.max()}]")
-        
-        # Generate seed
-        if seed is not None and seed > -1:
-            generator = torch.manual_seed(seed)
-        else:
-            generator = torch.manual_seed(42)
-        
-        # Load poses with looping
-        logger.info("Loading poses...")
-        pose_list = []
-        for index in range(video_length):
-            # Use modulo to loop poses infinitely
-            pose_index = index % pose_count
-            
-            tgt_musk = np.zeros((height, width, 3)).astype('uint8')
-            tgt_musk_path = os.path.join(pose_dir, f"{pose_index}.npy")
-            
-            if not os.path.exists(tgt_musk_path):
-                logger.warning(f"Pose file {pose_index}.npy not found, skipping")
-                continue
-            
-            detected_pose = np.load(tgt_musk_path, allow_pickle=True).tolist()
-            imh_new, imw_new, rb, re, cb, ce = detected_pose['draw_pose_params']
-            
-            # Validate pose parameters
-            if rb < 0 or cb < 0 or re > height or ce > width or rb >= re or cb >= ce:
-                logger.warning(f"Invalid pose bounds at frame {index}: rb={rb}, re={re}, cb={cb}, ce={ce}")
-                # Clamp to valid range
-                rb = max(0, min(rb, height))
-                re = max(rb + 1, min(re, height))
-                cb = max(0, min(cb, width))
-                ce = max(cb + 1, min(ce, width))
-            
-            im = draw_pose_select_v2(detected_pose, imh_new, imw_new, ref_w=min(width, height))
-            im = np.transpose(np.array(im), (1, 2, 0))
-            
-            # Validate pose image
-            if im.size == 0:
-                logger.warning(f"Empty pose image at frame {index}, using zero mask")
-                tgt_musk_pil = Image.fromarray(tgt_musk).convert('RGB')
-                pose_list.append(
-                    torch.Tensor(np.array(tgt_musk_pil)).to(dtype=weight_dtype, device=device).permute(2, 0, 1) / 255.0
-                )
-                continue
-            
-            if np.isnan(im).any() or np.isinf(im).any():
-                logger.warning(f"Invalid values in pose image at frame {index}, cleaning")
-                im = np.nan_to_num(im, nan=0.0, posinf=255.0, neginf=0.0)
-            
-            # Calculate target dimensions
-            target_h = re - rb
-            target_w = ce - cb
-            
-            # Resize if needed
-            if im.shape[0] != target_h or im.shape[1] != target_w:
-                if target_h > 0 and target_w > 0:
-                    im = cv2.resize(im, (target_w, target_h))
-                else:
-                    logger.warning(f"Invalid target dimensions at frame {index}: {target_h}x{target_w}")
-                    continue
-            
-            # Ensure coordinates are within bounds
-            if rb >= 0 and cb >= 0 and re <= height and ce <= width and rb < re and cb < ce:
-                tgt_musk[rb:re, cb:ce, :] = im
-            else:
-                logger.warning(f"Pose coordinates out of bounds for frame {index}")
-                continue
-            
-            tgt_musk_pil = Image.fromarray(np.array(tgt_musk)).convert('RGB')
-            pose_tensor = torch.Tensor(np.array(tgt_musk_pil)).to(dtype=weight_dtype, device=device).permute(2, 0, 1) / 255.0
-            
-            # Final validation of pose tensor
-            if torch.isnan(pose_tensor).any() or torch.isinf(pose_tensor).any():
-                logger.warning(f"Invalid tensor values at frame {index}, cleaning")
-                pose_tensor = torch.nan_to_num(pose_tensor, nan=0.0, posinf=1.0, neginf=0.0)
-                pose_tensor = torch.clamp(pose_tensor, 0.0, 1.0)
-            
-            pose_list.append(pose_tensor)
-        
-        poses_tensor = torch.stack(pose_list, dim=1).unsqueeze(0)
-        
-        # Trim audio to video length
-        audio_clip_trimmed = audio_clip.set_duration(video_length / fps)
-        
-        # Generate video
-        logger.info("Generating video frames...")
-        with torch.no_grad():
-            video = pipeline(
-                ref_img_pil,
-                str(audio_path),
-                poses_tensor[:, :, :video_length, ...],
-                width,
-                height,
-                video_length,
-                steps,
-                cfg,
-                generator=generator,
-                audio_sample_rate=16000,
-                context_frames=12,
-                fps=fps,
-                context_overlap=3,
-                start_idx=0
-            ).videos
-        
-        # Debug and validate output
-        logger.info(f"Pipeline output - Shape: {video.shape}, dtype: {video.dtype}")
-        logger.info(f"Video range: [{video.min().item():.4f}, {video.max().item():.4f}]")
-        logger.info(f"Contains NaN: {torch.isnan(video).any().item()}, Contains Inf: {torch.isinf(video).any().item()}")
-        
-        # Clean invalid values
-        if torch.isnan(video).any() or torch.isinf(video).any():
-            logger.warning("Video tensor contains invalid values! Cleaning...")
-            video = torch.nan_to_num(video, nan=0.0, posinf=1.0, neginf=0.0)
-            video = torch.clamp(video, 0.0, 1.0)
-            logger.info("Video tensor cleaned")
-        
-        # Ensure final length
-        final_length = min(video.shape[2], poses_tensor.shape[2], video_length)
-        video_sig = video[:, :, :final_length, :, :]
-        
-        logger.info(f"Final video tensor - Shape: {video_sig.shape}, range: [{video_sig.min().item():.4f}, {video_sig.max().item():.4f}]")
-        
-        # Save video without audio
-        logger.info("Saving video frames...")
-        output_path_no_audio = temp_dir / "output_no_audio.mp4"
-        save_videos_grid(
-            video_sig,
-            str(output_path_no_audio),
-            n_rows=1,
+        # Add background task
+        background_tasks.add_task(
+            process_video_task,
+            job_id=job_id,
+            image_path=image_path,
+            audio_path=audio_path,
+            pose_dir_name=pose_dir_name,
+            width=width,
+            height=height,
+            length=length,
+            steps=steps,
+            cfg=cfg,
             fps=fps,
+            seed=seed,
+            image_filename=image.filename,
+            audio_filename=audio.filename
         )
         
-        # Verify video file was created
-        if not output_path_no_audio.exists():
-            raise HTTPException(status_code=500, detail="Failed to create video file")
+        logger.info(f"[Job {job_id}] Created - Image: {image.filename}, Audio: {audio.filename}")
         
-        video_size = output_path_no_audio.stat().st_size
-        logger.info(f"Video file created: {video_size} bytes")
+        return JSONResponse(content={
+            "job_id": job_id,
+            "status": JobStatus.QUEUED,
+            "message": "Video generation started in background",
+            "status_url": f"/job-status/{job_id}",
+            "estimated_time": "Processing time depends on video length (typically 15-20 sec/sec of video)"
+        })
         
-        if video_size < 1000:
-            logger.error(f"Video file too small ({video_size} bytes), likely corrupted")
-            raise HTTPException(status_code=500, detail="Generated video is corrupted")
-        
-        # Add audio
-        logger.info("Adding audio to video...")
-        output_path = temp_dir / "output.mp4"
-        
-        try:
-            video_clip = VideoFileClip(str(output_path_no_audio))
-            video_clip = video_clip.set_audio(audio_clip_trimmed)
-            video_clip.write_videofile(
-                str(output_path),
-                codec="libx264",
-                audio_codec="aac",
-                threads=2,
-                logger=None,
-                preset='medium',
-                bitrate='5000k'
-            )
-            video_clip.close()
-        except Exception as e:
-            logger.error(f"Error adding audio to video: {e}")
-            # If audio merging fails, return video without audio
-            logger.warning("Returning video without audio")
-            output_path = output_path_no_audio
-        
-        # Clean up
-        audio_clip.close()
-        audio_clip_trimmed.close()
-        
-        logger.info(f"Video generated successfully: {output_path}")
-        
-        # Return video file
-        return FileResponse(
-            path=str(output_path),
-            media_type="video/mp4",
-            filename=f"generated_{Path(image.filename).stem}_{Path(audio.filename).stem}.mp4"
-        )
-    
     except Exception as e:
-        logger.error(f"Error generating video: {e}")
+        logger.error(f"[Job {job_id}] Error creating job: {e}")
+        # Clean up on error
+        try:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/job-status/{job_id}")
+async def get_job_status(job_id: str):
+    """
+    Get the status of a video generation job
+    
+    Args:
+        job_id: The job ID returned from /generate-video
+    
+    Returns:
+        JSON with job status, progress, and video URL (when completed)
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    job_info = jobs[job_id].copy()
+    
+    # Add helpful messages based on status
+    if job_info["status"] == JobStatus.COMPLETED:
+        job_info["message"] = "Video generation completed successfully!"
+    elif job_info["status"] == JobStatus.FAILED:
+        job_info["message"] = "Video generation failed. Check 'error' field for details."
+    elif job_info["status"] == JobStatus.PROCESSING:
+        job_info["message"] = "Video is being generated. This may take several minutes."
+    elif job_info["status"] == JobStatus.UPLOADING:
+        job_info["message"] = "Video generated, uploading to S3..."
+    else:
+        job_info["message"] = "Job is queued for processing."
+    
+    return job_info
+
+
+@app.get("/list-jobs")
+async def list_jobs(limit: Optional[int] = 50):
+    """
+    List all jobs (recent first)
+    
+    Args:
+        limit: Maximum number of jobs to return (default: 50)
+    
+    Returns:
+        List of all jobs with their status
+    """
+    job_list = list(jobs.values())
+    # Sort by created_at (most recent first)
+    job_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    
+    return {
+        "total_jobs": len(job_list),
+        "jobs": job_list[:limit]
+    }
 
 
 @app.get("/health")
