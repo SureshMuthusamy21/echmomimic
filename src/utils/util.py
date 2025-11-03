@@ -84,6 +84,18 @@ def save_videos_from_pil(pil_images, path, fps=8, audio_path=None):
 
 
 def save_videos_grid(videos: torch.Tensor, path: str, audio_path=None, rescale=False, n_rows=6, fps=8):
+    # Validate and clean video tensor before processing
+    if torch.isnan(videos).any():
+        print("WARNING: Video tensor contains NaN values, replacing with zeros")
+        videos = torch.where(torch.isnan(videos), torch.zeros_like(videos), videos)
+    
+    if torch.isinf(videos).any():
+        print("WARNING: Video tensor contains infinite values, replacing with zeros")
+        videos = torch.where(torch.isinf(videos), torch.zeros_like(videos), videos)
+    
+    # Clamp values to valid range [0, 1]
+    videos = torch.clamp(videos, 0.0, 1.0)
+    
     videos = rearrange(videos, "b c t h w -> t b c h w")
     height, width = videos.shape[-2:]
     outputs = []
@@ -93,6 +105,9 @@ def save_videos_grid(videos: torch.Tensor, path: str, audio_path=None, rescale=F
         x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)  # (h w c)
         if rescale:
             x = (x + 1.0) / 2.0  # -1,1 -> 0,1
+        
+        # Additional safety check before conversion
+        x = torch.clamp(x, 0.0, 1.0)
         x = (x * 255).numpy().astype(np.uint8)
         x = Image.fromarray(x)
 

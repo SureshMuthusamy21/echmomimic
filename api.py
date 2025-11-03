@@ -232,14 +232,18 @@ def load_models():
     pipeline = pipeline.to(device, dtype=weight_dtype)
     
     # Apply quantization for memory efficiency
-    try:
-        from torchao.quantization import quantize_, int8_weight_only
-        quantize_(denoising_unet, int8_weight_only())
-        logger.info("Applied INT8 quantization to denoising_unet")
-    except ImportError:
-        logger.warning("torchao not available, skipping quantization")
-    except Exception as e:
-        logger.warning(f"Could not apply quantization: {e}")
+    # DISABLED: Quantization can cause NaN values in output
+    # Uncomment below if you have memory issues and verify output is valid
+    # try:
+    #     from torchao.quantization import quantize_, int8_weight_only
+    #     quantize_(denoising_unet, int8_weight_only())
+    #     logger.info("Applied INT8 quantization to denoising_unet")
+    # except ImportError:
+    #     logger.warning("torchao not available, skipping quantization")
+    # except Exception as e:
+    #     logger.warning(f"Could not apply quantization: {e}")
+    
+    logger.info("Pipeline ready (quantization disabled for stability)")
     
     logger.info("Models loaded successfully!")
     return pipeline
@@ -396,6 +400,21 @@ async def generate_video(
         # Load reference image
         ref_img_pil = Image.open(image_path).convert("RGB")
         
+        # Resize to target dimensions
+        ref_img_pil = ref_img_pil.resize((width, height))
+        
+        # Validate reference image
+        ref_array = np.array(ref_img_pil)
+        if ref_array.size == 0:
+            raise HTTPException(status_code=400, detail="Invalid reference image: empty array")
+        
+        if np.isnan(ref_array).any() or np.isinf(ref_array).any():
+            logger.warning("Reference image contains invalid values, cleaning")
+            ref_array = np.nan_to_num(ref_array, nan=0.0, posinf=255.0, neginf=0.0)
+            ref_img_pil = Image.fromarray(ref_array.astype(np.uint8))
+        
+        logger.info(f"Reference image loaded: {ref_array.shape}, range: [{ref_array.min()}, {ref_array.max()}]")
+        
         # Generate seed
         if seed is not None and seed > -1:
             generator = torch.manual_seed(seed)
@@ -418,8 +437,31 @@ async def generate_video(
             
             detected_pose = np.load(tgt_musk_path, allow_pickle=True).tolist()
             imh_new, imw_new, rb, re, cb, ce = detected_pose['draw_pose_params']
+            
+            # Validate pose parameters
+            if rb < 0 or cb < 0 or re > height or ce > width or rb >= re or cb >= ce:
+                logger.warning(f"Invalid pose bounds at frame {index}: rb={rb}, re={re}, cb={cb}, ce={ce}")
+                # Clamp to valid range
+                rb = max(0, min(rb, height))
+                re = max(rb + 1, min(re, height))
+                cb = max(0, min(cb, width))
+                ce = max(cb + 1, min(ce, width))
+            
             im = draw_pose_select_v2(detected_pose, imh_new, imw_new, ref_w=min(width, height))
             im = np.transpose(np.array(im), (1, 2, 0))
+            
+            # Validate pose image
+            if im.size == 0:
+                logger.warning(f"Empty pose image at frame {index}, using zero mask")
+                tgt_musk_pil = Image.fromarray(tgt_musk).convert('RGB')
+                pose_list.append(
+                    torch.Tensor(np.array(tgt_musk_pil)).to(dtype=weight_dtype, device=device).permute(2, 0, 1) / 255.0
+                )
+                continue
+            
+            if np.isnan(im).any() or np.isinf(im).any():
+                logger.warning(f"Invalid values in pose image at frame {index}, cleaning")
+                im = np.nan_to_num(im, nan=0.0, posinf=255.0, neginf=0.0)
             
             # Calculate target dimensions
             target_h = re - rb
@@ -429,6 +471,9 @@ async def generate_video(
             if im.shape[0] != target_h or im.shape[1] != target_w:
                 if target_h > 0 and target_w > 0:
                     im = cv2.resize(im, (target_w, target_h))
+                else:
+                    logger.warning(f"Invalid target dimensions at frame {index}: {target_h}x{target_w}")
+                    continue
             
             # Ensure coordinates are within bounds
             if rb >= 0 and cb >= 0 and re <= height and ce <= width and rb < re and cb < ce:
@@ -438,9 +483,15 @@ async def generate_video(
                 continue
             
             tgt_musk_pil = Image.fromarray(np.array(tgt_musk)).convert('RGB')
-            pose_list.append(
-                torch.Tensor(np.array(tgt_musk_pil)).to(dtype=weight_dtype, device=device).permute(2, 0, 1) / 255.0
-            )
+            pose_tensor = torch.Tensor(np.array(tgt_musk_pil)).to(dtype=weight_dtype, device=device).permute(2, 0, 1) / 255.0
+            
+            # Final validation of pose tensor
+            if torch.isnan(pose_tensor).any() or torch.isinf(pose_tensor).any():
+                logger.warning(f"Invalid tensor values at frame {index}, cleaning")
+                pose_tensor = torch.nan_to_num(pose_tensor, nan=0.0, posinf=1.0, neginf=0.0)
+                pose_tensor = torch.clamp(pose_tensor, 0.0, 1.0)
+            
+            pose_list.append(pose_tensor)
         
         poses_tensor = torch.stack(pose_list, dim=1).unsqueeze(0)
         
@@ -467,11 +518,26 @@ async def generate_video(
                 start_idx=0
             ).videos
         
+        # Debug and validate output
+        logger.info(f"Pipeline output - Shape: {video.shape}, dtype: {video.dtype}")
+        logger.info(f"Video range: [{video.min().item():.4f}, {video.max().item():.4f}]")
+        logger.info(f"Contains NaN: {torch.isnan(video).any().item()}, Contains Inf: {torch.isinf(video).any().item()}")
+        
+        # Clean invalid values
+        if torch.isnan(video).any() or torch.isinf(video).any():
+            logger.warning("Video tensor contains invalid values! Cleaning...")
+            video = torch.nan_to_num(video, nan=0.0, posinf=1.0, neginf=0.0)
+            video = torch.clamp(video, 0.0, 1.0)
+            logger.info("Video tensor cleaned")
+        
         # Ensure final length
         final_length = min(video.shape[2], poses_tensor.shape[2], video_length)
         video_sig = video[:, :, :final_length, :, :]
         
+        logger.info(f"Final video tensor - Shape: {video_sig.shape}, range: [{video_sig.min().item():.4f}, {video_sig.max().item():.4f}]")
+        
         # Save video without audio
+        logger.info("Saving video frames...")
         output_path_no_audio = temp_dir / "output_no_audio.mp4"
         save_videos_grid(
             video_sig,
@@ -480,21 +546,41 @@ async def generate_video(
             fps=fps,
         )
         
+        # Verify video file was created
+        if not output_path_no_audio.exists():
+            raise HTTPException(status_code=500, detail="Failed to create video file")
+        
+        video_size = output_path_no_audio.stat().st_size
+        logger.info(f"Video file created: {video_size} bytes")
+        
+        if video_size < 1000:
+            logger.error(f"Video file too small ({video_size} bytes), likely corrupted")
+            raise HTTPException(status_code=500, detail="Generated video is corrupted")
+        
         # Add audio
         logger.info("Adding audio to video...")
         output_path = temp_dir / "output.mp4"
-        video_clip = VideoFileClip(str(output_path_no_audio))
-        video_clip = video_clip.set_audio(audio_clip_trimmed)
-        video_clip.write_videofile(
-            str(output_path),
-            codec="libx264",
-            audio_codec="aac",
-            threads=2,
-            logger=None
-        )
+        
+        try:
+            video_clip = VideoFileClip(str(output_path_no_audio))
+            video_clip = video_clip.set_audio(audio_clip_trimmed)
+            video_clip.write_videofile(
+                str(output_path),
+                codec="libx264",
+                audio_codec="aac",
+                threads=2,
+                logger=None,
+                preset='medium',
+                bitrate='5000k'
+            )
+            video_clip.close()
+        except Exception as e:
+            logger.error(f"Error adding audio to video: {e}")
+            # If audio merging fails, return video without audio
+            logger.warning("Returning video without audio")
+            output_path = output_path_no_audio
         
         # Clean up
-        video_clip.close()
         audio_clip.close()
         audio_clip_trimmed.close()
         
