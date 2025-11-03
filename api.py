@@ -22,6 +22,10 @@ from src.models.whisper.audio2feature import load_audio_model
 from src.pipelines.pipeline_echomimicv2_acc import EchoMimicV2Pipeline
 from src.utils.util import save_videos_grid
 from src.utils.dwpose_util import draw_pose_select_v2
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # <-- this loads .env into the environment
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -251,12 +255,41 @@ async def lifespan(app: FastAPI):
         # Check for missing models and download from S3 if needed
         download_from_s3_if_needed()
         
-        # Load models into memory
-        load_models()
-        logger.info("✓ Server ready to accept requests!")
+        # Try to load models into memory
+        try:
+            load_models()
+            logger.info("✓ Server ready to accept requests!")
+        except RuntimeError as e:
+            # Models are missing - server will start but endpoints won't work
+            logger.error(f"Failed to load models: {e}")
+            logger.error("=" * 80)
+            logger.error("SERVER STARTED IN DEGRADED MODE - Models are not loaded!")
+            logger.error("=" * 80)
+            logger.error("")
+            logger.error("To fix this issue, you have two options:")
+            logger.error("")
+            logger.error("Option 1: Configure AWS credentials to download from S3")
+            logger.error("  - Configure AWS CLI: aws configure")
+            logger.error("  - Or set environment variables:")
+            logger.error("    export AWS_ACCESS_KEY_ID=your_access_key")
+            logger.error("    export AWS_SECRET_ACCESS_KEY=your_secret_key")
+            logger.error("    export AWS_DEFAULT_REGION=your_region")
+            logger.error("")
+            logger.error("Option 2: Download models manually")
+            logger.error("  - Download the required models and place them in:")
+            logger.error(f"    {PRETRAINED_WEIGHTS_DIR.absolute()}")
+            logger.error("")
+            logger.error("Required models:")
+            for model_name, model_type in REQUIRED_MODEL_FILES.items():
+                logger.error(f"  - {model_name} ({model_type})")
+            logger.error("")
+            logger.error("=" * 80)
+            logger.error("The API will respond with 503 errors until models are available.")
+            logger.error("After adding models, restart the server.")
+            logger.error("=" * 80)
     except Exception as e:
-        logger.error(f"Failed to start server: {e}")
-        raise
+        logger.error(f"Unexpected error during startup: {e}")
+        # Don't raise - allow server to start
     
     yield
     
@@ -306,7 +339,19 @@ async def generate_video(
         Video file with synchronized audio
     """
     if pipeline is None:
-        raise HTTPException(status_code=503, detail="Models not loaded yet")
+        models_status = check_models_available()
+        missing_models = [k for k, v in models_status.items() if not v]
+        
+        error_detail = {
+            "error": "Models not loaded",
+            "reason": "Required model files are missing",
+            "missing_models": missing_models,
+            "instructions": {
+                "option_1": "Configure AWS credentials and restart the server to auto-download from S3",
+                "option_2": f"Manually download models to {PRETRAINED_WEIGHTS_DIR.absolute()} and restart"
+            }
+        }
+        raise HTTPException(status_code=503, detail=error_detail)
     
     # Create temp directory for processing
     temp_dir = Path(tempfile.mkdtemp())
@@ -483,12 +528,38 @@ async def health_check():
 async def models_status():
     """Check which models are available"""
     status = check_models_available()
+    missing_models = [k for k, v in status.items() if not v]
     
-    return {
-        "models_directory": str(PRETRAINED_WEIGHTS_DIR),
+    response = {
+        "models_directory": str(PRETRAINED_WEIGHTS_DIR.absolute()),
         "models": status,
-        "all_available": all(status.values())
+        "all_available": all(status.values()),
+        "pipeline_loaded": pipeline is not None
     }
+    
+    if missing_models:
+        response["missing_models"] = missing_models
+        response["setup_instructions"] = {
+            "aws_credentials": {
+                "description": "Configure AWS credentials to download from S3",
+                "commands": [
+                    "aws configure",
+                    "# OR set environment variables:",
+                    "export AWS_ACCESS_KEY_ID=your_access_key",
+                    "export AWS_SECRET_ACCESS_KEY=your_secret_key",
+                    "export AWS_DEFAULT_REGION=your_region"
+                ]
+            },
+            "manual_download": {
+                "description": "Download models manually",
+                "s3_bucket": S3_BUCKET,
+                "models_needed": missing_models,
+                "target_directory": str(PRETRAINED_WEIGHTS_DIR.absolute()),
+                "note": "After downloading, restart the server to load models"
+            }
+        }
+    
+    return response
 
 
 @app.get("/pose-directories")
@@ -513,6 +584,53 @@ async def list_pose_directories():
         "pose_base_directory": str(pose_base),
         "pose_directories": pose_info
     }
+
+
+@app.post("/download-models")
+async def download_models():
+    """
+    Manually trigger model download from S3
+    Use this after configuring AWS credentials
+    """
+    try:
+        # Check current status
+        models_status = check_models_available()
+        missing_before = [k for k, v in models_status.items() if not v]
+        
+        if not missing_before:
+            return {
+                "status": "success",
+                "message": "All models are already available",
+                "models": models_status
+            }
+        
+        # Try to download
+        logger.info("Manual download triggered via API")
+        download_from_s3_if_needed()
+        
+        # Check status after download
+        models_status_after = check_models_available()
+        missing_after = [k for k, v in models_status_after.items() if not v]
+        
+        if not missing_after:
+            return {
+                "status": "success",
+                "message": "All models downloaded successfully. Please restart the server to load them.",
+                "models": models_status_after,
+                "downloaded": missing_before
+            }
+        else:
+            return {
+                "status": "partial",
+                "message": "Some models are still missing. Check AWS credentials and S3 bucket access.",
+                "models": models_status_after,
+                "still_missing": missing_after,
+                "downloaded": [m for m in missing_before if m not in missing_after]
+            }
+    
+    except Exception as e:
+        logger.error(f"Error during manual download: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
