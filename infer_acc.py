@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument("--config", type=str, default="./configs/prompts/infer_acc.yaml")
     parser.add_argument("-W", type=int, default=768)
     parser.add_argument("-H", type=int, default=768)
-    parser.add_argument("-L", type=int, default=240)
+    parser.add_argument("-L", type=int, default=999999)  # Allow unlimited frames based on audio length
     parser.add_argument("--seed", type=int, default=420)
 
     parser.add_argument("--context_frames", type=int, default=12)
@@ -156,12 +156,28 @@ def main():
     save_dir = Path(f"output/{date_str}/{save_dir_name}")
     save_dir.mkdir(exist_ok=True, parents=True)
 
-    for ref_image_path in config["test_cases"].keys():
-        for file_path in config["test_cases"][ref_image_path]:
-            if ".wav" in file_path:
-                audio_path = file_path
-            else:
-                pose_dir = file_path
+    # Use command line arguments instead of config test_cases
+    ref_image_path = os.path.join(args.ref_images_dir, args.refimg_name)
+    audio_path = os.path.join(args.audio_dir, args.audio_name)
+    pose_dir = os.path.join(args.pose_dir, args.pose_name)
+    
+    # If files don't exist in the expected locations, try alternative paths
+    if not os.path.exists(ref_image_path):
+        # Try the filename directly in the refimg directory
+        alt_ref_path = os.path.join(args.ref_images_dir, "natural_bk_openhand", args.refimg_name)
+        if os.path.exists(alt_ref_path):
+            ref_image_path = alt_ref_path
+    
+    if not os.path.exists(audio_path):
+        # Try the current directory (where demo.mp3 actually is)
+        alt_audio_path = args.audio_name
+        if os.path.exists(alt_audio_path):
+            audio_path = alt_audio_path
+        else:
+            # Try the parent directory
+            alt_audio_path = f"../{args.audio_name}"
+            if os.path.exists(alt_audio_path):
+                audio_path = alt_audio_path
 
         if args.seed is not None and args.seed > -1:
             generator = torch.manual_seed(args.seed)
@@ -191,17 +207,46 @@ def main():
         ref_img_pil = Image.open(ref_image_path).convert("RGB")
         audio_clip = AudioFileClip(inputs_dict['audio'])
     
-        args.L = min(args.L, int(audio_clip.duration * final_fps), len(os.listdir(inputs_dict['pose'])))  
+        # Get pose count and calculate video length
+        pose_count = len(os.listdir(inputs_dict['pose']))
+        args.L = min(args.L, int(audio_clip.duration * final_fps))  # Only limited by audio length
+        
+        print(f"[INFO] Audio duration: {audio_clip.duration:.2f}s ({int(audio_clip.duration * final_fps)} frames)")
+        print(f"[INFO] Available poses: {pose_count} files")
+        print(f"[INFO] Generating: {args.L} frames ({args.L/final_fps:.2f}s)")
+        print(f"[INFO] Pose loops needed: {args.L / pose_count:.2f}x")
+        
         # ==================== face_locator =====================
         pose_list = []
         for index in range(start_idx, start_idx + args.L):
+            # Use modulo to loop poses infinitely
+            pose_index = index % pose_count
+            
             tgt_musk = np.zeros((args.W, args.H, 3)).astype('uint8')
-            tgt_musk_path = os.path.join(inputs_dict['pose'], "{}.npy".format(index))
+            tgt_musk_path = os.path.join(inputs_dict['pose'], "{}.npy".format(pose_index))
             detected_pose = np.load(tgt_musk_path, allow_pickle=True).tolist()
             imh_new, imw_new, rb, re, cb, ce = detected_pose['draw_pose_params']
-            im = draw_pose_select_v2(detected_pose, imh_new, imw_new, ref_w=800)
+            im = draw_pose_select_v2(detected_pose, imh_new, imw_new, ref_w=min(args.W, args.H))
             im = np.transpose(np.array(im),(1, 2, 0))
-            tgt_musk[rb:re,cb:ce,:] = im
+            
+            # Calculate the actual target dimensions
+            target_h = re - rb
+            target_w = ce - cb
+            
+            # Check if the pose image dimensions match the target region
+            if im.shape[0] != target_h or im.shape[1] != target_w:
+                # Resize to match the exact target region size
+                if target_h > 0 and target_w > 0:
+                    im = cv2.resize(im, (target_w, target_h))
+            
+            # Ensure coordinates are within bounds
+            if rb >= 0 and cb >= 0 and re <= args.H and ce <= args.W and rb < re and cb < ce:
+                tgt_musk[rb:re,cb:ce,:] = im
+            else:
+                # If coordinates are out of bounds, skip this pose or handle gracefully
+                print(f"Warning: Pose coordinates out of bounds for frame {index}")
+                # You could either skip this frame or resize the entire pose to fit
+                continue
 
             tgt_musk_pil = Image.fromarray(np.array(tgt_musk)).convert('RGB')
             pose_list.append(torch.Tensor(np.array(tgt_musk_pil)).to(dtype=weight_dtype, device=device).permute(2,0,1) / 255.0)

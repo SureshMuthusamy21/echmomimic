@@ -3,6 +3,7 @@ import random
 from pathlib import Path
 import numpy as np
 import torch
+import cv2
 from diffusers import AutoencoderKL, DDIMScheduler
 from PIL import Image
 from src.models.unet_2d_condition import UNet2DConditionModel
@@ -159,13 +160,28 @@ def generate(image_input, audio_input, pose_input, width, height, length, steps,
 
     pose_list = []
     for index in range(start_idx, start_idx + length):
-        tgt_musk = np.zeros((width, height, 3)).astype('uint8')
+        tgt_musk = np.zeros((height, width, 3)).astype('uint8')
         tgt_musk_path = os.path.join(inputs_dict['pose'], "{}.npy".format(index))
         detected_pose = np.load(tgt_musk_path, allow_pickle=True).tolist()
         imh_new, imw_new, rb, re, cb, ce = detected_pose['draw_pose_params']
-        im = draw_pose_select_v2(detected_pose, imh_new, imw_new, ref_w=800)
+        im = draw_pose_select_v2(detected_pose, imh_new, imw_new, ref_w=min(width, height))
         im = np.transpose(np.array(im),(1, 2, 0))
-        tgt_musk[rb:re,cb:ce,:] = im
+        
+        # Ensure the pose region fits within the target mask
+        if rb >= 0 and cb >= 0 and re <= height and ce <= width and rb < re and cb < ce:
+            tgt_musk[rb:re,cb:ce,:] = im
+        else:
+            # Resize the pose image to fit the target dimensions if needed
+            target_h, target_w = re - rb, ce - cb
+            if target_h > 0 and target_w > 0:
+                im_resized = cv2.resize(im, (target_w, target_h))
+                # Clamp the coordinates to valid ranges
+                rb = max(0, min(rb, height))
+                re = max(rb, min(re, height))
+                cb = max(0, min(cb, width))
+                ce = max(cb, min(ce, width))
+                if re > rb and ce > cb:
+                    tgt_musk[rb:re,cb:ce,:] = im_resized
 
         tgt_musk_pil = Image.fromarray(np.array(tgt_musk)).convert('RGB')
         pose_list.append(torch.Tensor(np.array(tgt_musk_pil)).to(dtype=dtype, device=device).permute(2,0,1) / 255.0)
